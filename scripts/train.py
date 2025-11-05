@@ -12,44 +12,49 @@ from training.train_fno import FourierNeuralOperator
 from operator_learning.utils.misc import readConfig, print_rank0
 torch.set_float32_matmul_precision('high')
 
-# -----------------------------------------------------------------------------
-# Script parameters
-# -----------------------------------------------------------------------------
-parser = argparse.ArgumentParser(
-    description='Train a 1D/2D/3D FNO model on a given dataset',
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument(
-    "--trainDir", default="trainDir", help="directory to store training results")
-parser.add_argument(
-    "--dataFile", type=str, help="path to Hdf5 data file")
-parser.add_argument(
-    "--epochs", default=200, type=int, help="training epochs")
-parser.add_argument(
-    "--checkpoint", help="model checkpoint name")
-parser.add_argument(
-    "--saveInterval", default=100, type=int, help="save checkpoint interval")
-parser.add_argument(
-    "--disableTensorboard", action="store_true", help="disable Tensorboard logging")
-parser.add_argument(
-    "--lossesFile", default=FourierNeuralOperator.LOSSES_FILE, help='base text file to write the loss')
-parser.add_argument(
-    "--benchmark", action="store_true", help="benchmark run")
-parser.add_argument(
-    "--use_amp", type=int, default=0, help="mixed precision training  [0:False, 1:True]")
-parser.add_argument(
-    "--use_complex_amp", type=int, default=0, help="mixed precision training with explicit \
-    complexHalf type  [0:False, 1:True]")
-parser.add_argument(
-    "--compile_train", type=int, default=0, help="use torch.compile for training [0:False, 1:True]")
-parser.add_argument(
-    "--compile_mode", type=str, default="default", 
-    help="compile options ['eager', 'default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs']")
-parser.add_argument(
-    "--config", default="config.yaml", help="configuration file")
-args = parser.parse_args()
 
-def main(args):
-    config = readConfig(args.config)
+def parse_args():
+    # -----------------------------------------------------------------------------
+    # Script parameters
+    # -----------------------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        description='Train a 1D/2D/3D FNO model on a given dataset',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument(
+        "--trainDir", default="trainDir", help="directory to store training results")
+    parser.add_argument(
+        "--dataFile", type=str, help="path to Hdf5 data file")
+    parser.add_argument(
+        "--epochs", default=200, type=int, help="training epochs")
+    parser.add_argument(
+        "--checkpoint", help="model checkpoint name")
+    parser.add_argument(
+        "--saveInterval", default=100, type=int, help="save checkpoint interval")
+    parser.add_argument(
+        "--disableTensorboard", action="store_true", help="disable Tensorboard logging")
+    parser.add_argument(
+        "--lossesFile", default=FourierNeuralOperator.LOSSES_FILE, help='base text file to write the loss')
+    parser.add_argument(
+        "--benchmark", action="store_true", help="benchmark run")
+    parser.add_argument(
+        "--use_amp", type=int, default=0, help="mixed precision training  [0:False, 1:True]")
+    parser.add_argument(
+        "--use_complex_amp", type=int, default=0, help="mixed precision training with explicit \
+        complexHalf type  [0:False, 1:True]")
+    parser.add_argument(
+        "--compile_train", type=int, default=0, help="use torch.compile for training [0:False, 1:True]")
+    parser.add_argument(
+        "--compile_mode", type=str, default="default", 
+        help="compile options ['eager', 'default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs']")
+    parser.add_argument(
+        "--configf", default="config.yaml", help="configuration file")
+    return parser.parse_args()
+
+def main(args=None):
+    if args is None:
+        args = parse_args()
+
+    config = readConfig(args.configf)
     if "train" in config:
         print(f'Overwriting args with config values..')
         args.__dict__.update(**config.train)
@@ -94,4 +99,4 @@ def main(args):
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     mp.freeze_support()
-    main(args)
+    main(parse_args())

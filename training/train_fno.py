@@ -11,11 +11,16 @@ import torch.profiler as tprof
 import torch.cuda.nvtx as nvtx
 from operator_learning.data import getDataLoaders
 from operator_learning.model import FNO
-from operator_learning.loss import LOSSES_CLASSES
+from operator_learning.loss import get_loss_fn
 from operator_learning.utils.communication import Communicator
 from operator_learning.utils.misc import print_rank0, NoScale, compile_timing, optimizer_step, scheduler_step
 from operator_learning.utils.misc import register_dtype_hooks
 torch.set_float32_matmul_precision('high')
+
+
+from cantilever.core.timer import timeit
+import torchcompat.core as acc
+
 
 class FourierNeuralOperator:
     
@@ -31,9 +36,10 @@ class FourierNeuralOperator:
                 use_amp=False, compile=False, compile_mode='default', data_class='pic'):
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = acc.fetch_device(int(os.getenv('LOCAL_RANK', '0'))) # torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = device
+    
         self.rank = int(os.getenv('RANK', '0'))
         self.world_size = int(os.getenv('WORLD_SIZE', '1'))
         self.debug = debug
@@ -119,21 +125,7 @@ class FourierNeuralOperator:
         self.outType = self.dataset.outType
         self.outScaling = self.dataset.outScaling
 
-        # Loss
-        if loss is None:    # Use default settings
-            loss = {
-                "name": "VectorNormLoss",
-                "absolute": False,
-            }
-        assert "name" in loss, "Loss config must have a 'name'"
-        self.loss_config = loss.copy()
-        loss_class = LOSSES_CLASSES.get(self.loss_config.pop("name"))
-        if loss_class is None:
-            raise NotImplementedError(f"Unknown loss type, available are {list(LOSSES_CLASSES.keys())}")
-
-        # if "grids" in loss:
-        #     loss["grids"] = self.dataset.grid
-        self.lossFunction = loss_class(**self.loss_config, device=self.device)
+        self.lossFunction = get_loss_fn(loss, self.device)
 
         # Loss tracking
         if self.dataClass == 'rbc':
@@ -208,7 +200,7 @@ class FourierNeuralOperator:
         total_loss = 0.0
         nBatches = len(loader)
         data_iter = iter(loader)
-
+ 
         if self.use_domain_sampling and not self.data_config['pad_to_fullGrid']:
             # [nBatches=nPatch_per_sample, batchSize=nSamples/nBatches, channel, nX, ny]
             inp_list, out_list = next(data_iter)  
@@ -251,7 +243,13 @@ class FourierNeuralOperator:
             nvtx.range_push(f"TrainEpoch_{self.epochs}")
 
         nBatches = len(self.trainLoader)
-        data_iter = iter(self.trainLoader)
+        with timeit("iter"):
+            data_iter = iter(self.trainLoader)
+        
+        # data_iter: <generator object TimedIterator.wrapped at 0x7f6828d7fcd0>
+        # self.trainLoader: <benchmate.metrics.TimedIterator object at 0x7f6828d2c1d0>
+
+        losses = []
         total_loss = 0.0
         gradsEpoch = 0.0
         if self.dataClass == 'rbc':
@@ -264,114 +262,128 @@ class FourierNeuralOperator:
             inp_list, out_list = next(data_iter)
             nBatches = len(inp_list)
 
-        for iBatch in range(nBatches):
-            # Batch
-            # if self.enable_profile:
-            #     nvtx.range_push(f"TrainBatch_{iBatch}")
-            with torch.autocast(device_type=self.autocast_device_type, dtype=torch.float16, enabled=self.use_amp):
-                if self.use_domain_sampling and not self.data_config['pad_to_fullGrid']:
-                    data = (inp_list[iBatch], out_list[iBatch])
-                else:
-                    data = next(data_iter)
-                inp = data[0][..., ::self.xStep, ::self.yStep].to(self.device)
-                ref = data[1][..., ::self.xStep, ::self.yStep].to(self.device)
+        # from threading import get_native_id
 
-                # Forward pass
-                if self.enable_profile:
-                    nvtx.range_push("forward")
-                pred = model(inp)
-                if self.enable_profile:
-                    nvtx.range_pop()   # end forward
+        with timeit("loop"):
+            for iBatch in range(nBatches):
+                with timeit("body"):
+                    # print(get_native_id())
+                    # Batch
+                    # if self.enable_profile:
+                    #     nvtx.range_push(f"TrainBatch_{iBatch}")
+                    with torch.autocast(device_type=self.autocast_device_type, dtype=torch.float16, enabled=self.use_amp):
+                        with timeit("next"):
+                            if self.use_domain_sampling and not self.data_config['pad_to_fullGrid']:
+                                data = (inp_list[iBatch], out_list[iBatch])
+                            else:
+                                data = next(data_iter)
+                        
+                            inp = data[0][..., ::self.xStep, ::self.yStep].to(self.device)
+                            ref = data[1][..., ::self.xStep, ::self.yStep].to(self.device)
 
-                if self.enable_profile:
-                    nvtx.range_push("loss")
-                loss = self.lossFunction(pred, ref)
-                if self.enable_profile:
-                    nvtx.range_pop() # end loss
-            
-            optimizer.zero_grad()
-            if self.debug:
-                print_rank0(f"[DEBUG] batch loss: {loss.item():.6e}, pred min/max: {pred.min().item():.6e}/{pred.max().item():.6e}, \
-                             ref min/max: {ref.min().item():.6e}/{ref.max().item():.6e}")
-            
-            if self.benchmark and iBatch % 10 == 0:
-                allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # MB
-                reserved = torch.cuda.memory_reserved() / (1024 ** 2)    # MB
-                fwd_peak_mem.append(allocated)
-                fwd_reserv_mem.append(reserved)
+                        # Forward pass
+                        with timeit("forward"):
+                            if self.enable_profile:
+                                nvtx.range_push("forward")
+                            pred = model(inp)
+                            if self.enable_profile:
+                                nvtx.range_pop()   # end forward
 
-            # Backward 
-            if self.enable_profile:
-                nvtx.range_push("backward")
-            self.scaler.scale(loss).backward()
-            if self.enable_profile:
-                nvtx.range_pop()  # end backward
-            
-            if self.debug:
-                any_grad_nonzero = False
-                for name, p in self.model.named_parameters():
-                    if p.grad is not None and p.grad.abs().sum() > 0:
-                        any_grad_nonzero = True
-                        break
-                print_rank0(f"[DEBUG] Any nonzero gradients: {any_grad_nonzero}")
-                for name, param in self.model.named_parameters():
-                    if param.grad is None:
-                        print_rank0(f"[DEBUG] {name} has no gradient")
-                    else:
-                        print_rank0(f"[DEBUG] {name} grad mean: {param.grad.mean().item():.6e}")
+                            if self.enable_profile:
+                                nvtx.range_push("loss")
+                            loss = self.lossFunction(pred, ref)
+                            if self.enable_profile:
+                                nvtx.range_pop() # end loss
+                        
+                    with timeit("backward"):
+                        optimizer.zero_grad()
+                        if self.debug:
+                            print_rank0(f"[DEBUG] batch loss: {loss.item():.6e}, pred min/max: {pred.min().item():.6e}/{pred.max().item():.6e}, \
+                                        ref min/max: {ref.min().item():.6e}/{ref.max().item():.6e}")
+                        
+                        if self.benchmark and iBatch % 10 == 0:
+                            allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # MB
+                            reserved = torch.cuda.memory_reserved() / (1024 ** 2)    # MB
+                            fwd_peak_mem.append(allocated)
+                            fwd_reserv_mem.append(reserved)
 
-                real_model = self.model.module if self.DDP_enabled else self.model
-                param_before = real_model.P.layers[0].weight.clone()
+                        # Backward 
+                        if self.enable_profile:
+                            nvtx.range_push("backward")
+                        self.scaler.scale(loss).backward()
+                        if self.enable_profile:
+                            nvtx.range_pop()  # end backward
+                        
+                        if self.debug:
+                            any_grad_nonzero = False
+                            for name, p in self.model.named_parameters():
+                                if p.grad is not None and p.grad.abs().sum() > 0:
+                                    any_grad_nonzero = True
+                                    break
+                            print_rank0(f"[DEBUG] Any nonzero gradients: {any_grad_nonzero}")
+                            for name, param in self.model.named_parameters():
+                                if param.grad is None:
+                                    print_rank0(f"[DEBUG] {name} has no gradient")
+                                else:
+                                    print_rank0(f"[DEBUG] {name} grad mean: {param.grad.mean().item():.6e}")
 
-            # Optimizer
-            if self.enable_profile:
-                nvtx.range_push("optimizer_step")
-            optimizer_step(self.scaler, optimizer)
-            if self.enable_profile:
-                nvtx.range_pop() # end optimizer
+                            real_model = self.model.module if self.DDP_enabled else self.model
+                            param_before = real_model.P.layers[0].weight.clone()
 
-            if self.benchmark and iBatch % 10 == 0:
-                allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # MB
-                reserved = torch.cuda.memory_reserved() / (1024 ** 2)    # MB
-                bwd_peak_mem.append(allocated)
-                bwd_reserv_mem.append(reserved)
+                        # Optimizer
+                        if self.enable_profile:
+                            nvtx.range_push("optimizer_step")
+                        optimizer_step(self.scaler, optimizer)
+                        if self.enable_profile:
+                            nvtx.range_pop() # end optimizer
 
-            if self.enable_profile:
-                if self.profiler_type == "torch":
-                    self.profiler.step()
-            #     nvtx.range_pop() # end batch
+                    with timeit("others"):
+                        if self.benchmark and iBatch % 10 == 0:
+                            allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # MB
+                            reserved = torch.cuda.memory_reserved() / (1024 ** 2)    # MB
+                            bwd_peak_mem.append(allocated)
+                            bwd_reserv_mem.append(reserved)
 
-            if self.debug:
-                param_after = real_model.P.layers[0].weight
-                print_rank0(f"Param changed: {not torch.allclose(param_before, param_after)}")
-                param_change = (param_before - param_after).norm().item()
-                print_rank0(f"[DEBUG] Parameter change norm: {param_change:.6e}")
-                # check if params update + optimizer states populated
-                with torch.no_grad():
-                    first_param = next(model.parameters())
-                    print_rank0(f"[DEBUG][train] Param[0] value sample: {first_param.view(-1)[0].item():.6e}")
-                opt_state = optimizer.state_dict()
-                if opt_state["state"]:
-                    first_state = next(iter(opt_state["state"].values()))
-                    for k, v in first_state.items():
-                        if isinstance(v, torch.Tensor):
-                            print_rank0(f"[DEBUG][train] Optimizer state {k}: mean={v.float().mean().item():.6e}")
-                else:
-                    print_rank0("[DEBUG][train] Optimizer state is EMPTY after step()!")
+                        if self.enable_profile:
+                            if self.profiler_type == "torch":
+                                self.profiler.step()
+                        #     nvtx.range_pop() # end batch
 
-            grads = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
-            grad_norm = grads.norm()
-            gradsEpoch += grad_norm
+                        if self.debug:
+                            param_after = real_model.P.layers[0].weight
+                            print_rank0(f"Param changed: {not torch.allclose(param_before, param_after)}")
+                            param_change = (param_before - param_after).norm().item()
+                            print_rank0(f"[DEBUG] Parameter change norm: {param_change:.6e}")
+                            # check if params update + optimizer states populated
+                            with torch.no_grad():
+                                first_param = next(model.parameters())
+                                print_rank0(f"[DEBUG][train] Param[0] value sample: {first_param.view(-1)[0].item():.6e}")
+                            opt_state = optimizer.state_dict()
+                            if opt_state["state"]:
+                                first_state = next(iter(opt_state["state"].values()))
+                                for k, v in first_state.items():
+                                    if isinstance(v, torch.Tensor):
+                                        print_rank0(f"[DEBUG][train] Optimizer state {k}: mean={v.float().mean().item():.6e}")
+                            else:
+                                print_rank0("[DEBUG][train] Optimizer state is EMPTY after step()!")
 
-            if self.USE_TENSORBOARD:
-                self.writer.add_scalar("Gradients/Norm", grad_norm,iBatch)
-                
-            # print_rank0(f" At [{iBatch*batchSize + len(inp)}/{nSamples:>5d}] loss: {loss.item():>7f} (id: {idLoss:>7f}) -- lr: {optimizer.param_groups[0]['lr']}")
-            total_loss += loss.item()
+                        grads = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+                        grad_norm = grads.norm()
+                        gradsEpoch += grad_norm
 
+                        if self.USE_TENSORBOARD:
+                            self.writer.add_scalar("Gradients/Norm", grad_norm,iBatch)
+                            
+                    # print_rank0(f" At [{iBatch*batchSize + len(inp)}/{nSamples:>5d}] loss: {loss.item():>7f} (id: {idLoss:>7f}) -- lr: {optimizer.param_groups[0]['lr']}")
+                    with timeit("loss.item"):
+                        losses.append(loss.detach())
+                        # total_loss += loss.item()
+
+        # =========
         if self.USE_TENSORBOARD:
             self.writer.add_scalar("LearningRate", optimizer.param_groups[0]['lr'], self.epochs)
 
+        total_loss = sum([l.item() for l in losses]) / len(losses)
         scheduler_step(scheduler)
         avg_loss = total_loss / nBatches
 
@@ -492,54 +504,57 @@ class FourierNeuralOperator:
             train_fn = self.train
 
         for i in range(start_epoch, end_epoch):
-            print_rank0(f"\nEpoch {i}")
+            with timeit("epoch"):
+                print_rank0(f"\nEpoch {i}")
 
-            t0_epoch = time.perf_counter()
-            # start profiling only from 3 iteration
-            if i == 3 and self.enable_profile and self.profiler_type == "nsys":
-                torch.cuda.cudart().cudaProfilerStart()
+                t0_epoch = time.perf_counter()
+                # start profiling only from 3 iteration
+                if i == 3 and self.enable_profile and self.profiler_type == "nsys":
+                    torch.cuda.cudart().cudaProfilerStart()
 
-            t0_comp = time.perf_counter()
-            if self.benchmark:
-                _, compile_time = compile_timing(lambda: train_fn())
-                compile_times.append(compile_time)
-                print_rank0(f"{mode_name} train time (epoch {i}): {compile_time:.4f}s")
-            else:
-                train_fn()
-            t_train = time.perf_counter() - t0_comp
-            self.valid()
-            t_comp = time.perf_counter() - t0_comp
-            self.tCompEpoch = t_comp
+                t0_comp = time.perf_counter()
+                with timeit("train"):
+                    if self.benchmark:
+                        _, compile_time = compile_timing(lambda: train_fn())
+                        compile_times.append(compile_time)
+                        print_rank0(f"{mode_name} train time (epoch {i}): {compile_time:.4f}s")
+                    else:
+                        train_fn()
+                    
+                t_train = time.perf_counter() - t0_comp
+                self.valid()
+                t_comp = time.perf_counter() - t0_comp
+                self.tCompEpoch = t_comp
 
-            t0_monit = time.perf_counter()
-            self.monitor()
-            t_monit = time.perf_counter() - t0_monit
+                t0_monit = time.perf_counter()
+                self.monitor()
+                t_monit = time.perf_counter() - t0_monit
 
-            if i % save_interval == 0 or i == end_epoch-1 :
-                if self.enable_profile:
-                    nvtx.range_push("checkpointing")
+                if i % save_interval == 0 or i == end_epoch-1 :
+                    if self.enable_profile:
+                        nvtx.range_push("checkpointing")
 
-                t0_save = time.perf_counter()
-                self.save(f'model_epoch{i}.pt')
-                t_save = time.perf_counter() - t0_save
+                    t0_save = time.perf_counter()
+                    self.save(f'model_epoch{i}.pt')
+                    t_save = time.perf_counter() - t0_save
 
-                if self.enable_profile:
-                    nvtx.range_pop()  # end checkpoint
+                    if self.enable_profile:
+                        nvtx.range_pop()  # end checkpoint
 
-                if self.benchmark:
-                    checkpoint_time.append(t_save)
+                    if self.benchmark:
+                        checkpoint_time.append(t_save)
 
-                print_rank0(f" --- End of epoch {self.epochs} (tComp: {t_comp:1.2e}s, tMonit: {t_monit:1.2e}s tSave: {t_save:1.2e}s) ---")
+                    print_rank0(f" --- End of epoch {self.epochs} (tComp: {t_comp:1.2e}s, tMonit: {t_monit:1.2e}s tSave: {t_save:1.2e}s) ---")
 
-            t_epoch = time.perf_counter() - t0_epoch
+                t_epoch = time.perf_counter() - t0_epoch
 
-            if self.benchmark and i > 1:
-                epoch_time.append(t_epoch)
-                compute_time.append(t_comp)
-                train_time.append(t_train)
-                monitor_time.append(t_monit)
+                if self.benchmark and i > 1:
+                    epoch_time.append(t_epoch)
+                    compute_time.append(t_comp)
+                    train_time.append(t_train)
+                    monitor_time.append(t_monit)
 
-            self.epochs += 1
+                self.epochs += 1
         
         print_rank0("Done Training!")
         if self.enable_profile and self.profiler_type == "nsys":

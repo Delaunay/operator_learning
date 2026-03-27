@@ -144,3 +144,21 @@ class MSELoss(nn.Module):
             loss = self.loss_fn(pred.flatten(start_dim=1), ref.flatten(start_dim=1))
 
         return loss
+
+
+def get_loss_fn(loss, device):
+    # Loss
+    if loss is None:    # Use default settings
+        loss = {
+            "name": "VectorNormLoss",
+            "absolute": False,
+        }
+    assert "name" in loss, "Loss config must have a 'name'"
+    loss_config = loss.copy()
+    loss_class = LOSSES_CLASSES.get(loss_config.pop("name"))
+    if loss_class is None:
+        raise NotImplementedError(f"Unknown loss type, available are {list(LOSSES_CLASSES.keys())}")
+
+    # if "grids" in loss:
+    #     loss["grids"] = self.dataset.grid
+    return loss_class(**loss_config, device=device)
